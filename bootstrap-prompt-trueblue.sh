@@ -15,7 +15,6 @@ if [[ $- == *i* ]]; then
   source "$RC"
 fi
 
-echo "✅ 写入完成：$RC"
-echo "   已添加："
-echo "   $MARK"
-echo "   $LINE"
+echo "✅ 写入完成：$LINE"
+echo "✅ Bash 提示符已配置：主机名绿色、目录真蓝(24-bit)。"
+
