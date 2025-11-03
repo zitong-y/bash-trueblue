@@ -71,9 +71,8 @@ detect_current_shell() {
                *) printf "sh";; esac
 }
 
-# ===================== libc 检测 & 版本比较 =====================
-ver_ge(){  # ver_ge 2.18 2.17 -> true
-  # 纯 bash 版本比较：按点拆分逐段比较
+# ===================== 版本比较 / libc 检测 =====================
+ver_ge(){  # ver_ge <v1> <v2> : v1 >= v2 ?
   local IFS=.; local -a A=(${1//[!0-9.]/}); local -a B=(${2//[!0-9.]/}); local i
   for ((i=0; i<${#A[@]} || i<${#B[@]}; i++)); do
     local a=${A[i]:-0}; local b=${B[i]:-0}
@@ -84,29 +83,60 @@ ver_ge(){  # ver_ge 2.18 2.17 -> true
 }
 
 detect_libc() {
-  # 输出两行：第一行为 libc 名（glibc/musl/unknown），第二行是版本（可能为空）
-  local out ver
+  # 回传两变量：LIBC_NAME, LIBC_VER
+  LIBC_NAME="unknown"; LIBC_VER=""
   if command -v ldd >/dev/null 2>&1; then
-    out="$(ldd --version 2>&1 || true)"
+    local out; out="$(ldd --version 2>&1 || true)"
     if grep -qi 'musl' <<<"$out"; then
-      ver="$(grep -oE 'musl[^0-9]*([0-9]+(\.[0-9]+)*)' <<<"$out" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1 || true)"
-      printf "musl\n%s\n" "${ver:-}"
-      return
+      LIBC_NAME="musl"
+      LIBC_VER="$(grep -oE 'musl[^0-9]*([0-9]+(\.[0-9]+)*)' <<<"$out" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1 || true)"
+      return 0
     fi
     if grep -qi 'glibc\|gnu libc\|gnu c library' <<<"$out"; then
-      ver="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | head -1 || true)"
-      printf "glibc\n%s\n" "${ver:-}"
-      return
-    fi
-    # 某些发行版 ldd 第一行：ldd (Debian GLIBC 2.36-xx) 2.36
-    if grep -qi 'glibc' <<<"$out"; then
-      ver="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | tail -1 || true)"
-      printf "glibc\n%s\n" "${ver:-}"
-      return
+      LIBC_NAME="glibc"
+      # Debian 风格可能有两处数字，取最后一个
+      LIBC_VER="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | tail -1 || true)"
+      return 0
     fi
   fi
-  # Alpine 的 ldd 也会打印 musl；极少数系统没有 ldd
-  printf "unknown\n\n"
+  return 0
+}
+
+need_musl_due_to_glibc() {
+  # 条件1：glibc 且版本 < 2.18
+  detect_libc
+  if [[ "$LIBC_NAME" == "glibc" ]]; then
+    [[ -n "$LIBC_VER" ]] && ! ver_ge "$LIBC_VER" "2.18" && return 0
+  fi
+  # 条件2：系统不是 glibc（musl/unknown），直接用 musl 更稳
+  if [[ "$LIBC_NAME" != "glibc" ]]; then
+    return 0
+  fi
+  # 条件3：已有 starship 但运行时报 glibc 符号错误
+  if command -v starship >/dev/null 2>&1; then
+    if ! starship --version >/dev/null 2>&1; then
+      starship --version 2>&1 | grep -q 'GLIBC_2\.18' && return 0
+    fi
+  fi
+  return 1
+}
+
+choose_prebuilt_pkg() {
+  # 根据架构 + libc 决定下载的包名，echo 返回
+  local arch uname_m pkg
+  uname_m="$(uname -m)"
+  case "$uname_m" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *) warn "Unsupported arch: $uname_m"; return 1 ;;
+  esac
+
+  if need_musl_due_to_glibc; then
+    pkg="starship-${arch}-unknown-linux-musl.tar.gz"
+  else
+    pkg="starship-${arch}-unknown-linux-gnu.tar.gz"
+  fi
+  echo "$pkg"
 }
 
 # ===================== 安装 Starship =====================
@@ -143,30 +173,15 @@ install_starship_pkg() {
 
 install_starship_auto_fallback() {
   command -v starship >/dev/null 2>&1 && return 0
-  local arch pkg url=/tmp/starship.tgz
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) warn "Unsupported arch: $(uname -m)"; return 1 ;;
-  esac
-
-  # 选择 GNU 或 MUSL
-  read -r libc_name
-  read -r libc_ver < <(detect_libc | sed -n '2p') # 兼容老 bash 的 trick
-  libc_name="$(detect_libc | sed -n '1p')"
-  libc_ver="$(detect_libc | sed -n '2p')"
-
-  # 如果是 glibc 且版本 >= 2.18，用 gnu；否则一律 musl
-  if [[ "$libc_name" == "glibc" && -n "$libc_ver" ]] && ver_ge "$libc_ver" "2.18"; then
-    pkg="starship-${arch}-unknown-linux-gnu.tar.gz"
+  local pkg url=/tmp/starship.tgz
+  pkg="$(choose_prebuilt_pkg)" || { warn "failed to choose prebuilt pkg"; return 1; }
+  log "Installing via prebuilt fallback (pkg: $pkg)..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
+      "https://github.com/starship/starship/releases/latest/download/$pkg"
   else
-    pkg="starship-${arch}-unknown-linux-musl.tar.gz"
+    wget -O "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"
   fi
-
-  log "Installing via prebuilt fallback ($libc_name ${libc_ver:-?} -> $pkg)..."
-  curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
-    "https://github.com/starship/starship/releases/latest/download/$pkg"
   $SUDO tar -xzf "$url" -C /usr/local/bin starship
   $SUDO chmod +x /usr/local/bin/starship
 }
@@ -202,6 +217,9 @@ truncate_to_repo = false
 [character]
 success_symbol = "[›](bold green) "
 error_symbol   = "[›](bold red) "
+
+[cmd_duration]
+disabled = true
 TOML
   if [[ "$ENABLE_DURATION" -eq 1 ]]; then
     cat >>"$file" <<'TOML'
@@ -210,11 +228,6 @@ min_time = 2000
 format = " took [$duration]($style)"
 style = "bold yellow"
 disabled = false
-TOML
-  else
-    cat >>"$file" <<'TOML'
-[cmd_duration]
-disabled = true
 TOML
   fi
   log "Wrote $file"
@@ -246,6 +259,30 @@ main() {
     fi
   else
     log "Skip install as requested."
+  fi
+
+  # 若已有 starship 但是 glibc 错误，自动换 MUSL（保险起见）
+  if command -v starship >/dev/null 2>&1; then
+    if ! starship --version >/dev/null 2>&1; then
+      if starship --version 2>&1 | grep -q 'GLIBC_2\.18'; then
+        warn "Detected GLIBC_2.18 error; switching to MUSL build..."
+        # 覆盖安装 MUSL 版本
+        choose_prebuilt_pkg >/dev/null
+        # 强制 MUSL
+        local arch uname_m url=/tmp/starship.tgz
+        uname_m="$(uname -m)"
+        case "$uname_m" in x86_64|amd64) arch="x86_64";; aarch64|arm64) arch="aarch64";; *) arch="x86_64";; esac
+        local pkg="starship-${arch}-unknown-linux-musl.tar.gz"
+        if command -v curl >/dev/null 2>&1; then
+          curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
+            "https://github.com/starship/starship/releases/latest/download/$pkg"
+        else
+          wget -O "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"
+        fi
+        $SUDO tar -xzf "$url" -C /usr/local/bin starship
+        $SUDO chmod +x /usr/local/bin/starship
+      fi
+    fi
   fi
 
   write_starship_toml
