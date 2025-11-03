@@ -19,8 +19,8 @@ while [[ $# -gt 0 ]]; do
 Usage: bash ./install_starship_unix.sh [--enable-duration] [--force] [--shell <bash|zsh|fish|...>] [--no-install]
 
 功能：
-- 自动安装 Starship（优先包管理器；失败回退为 **musl 静态版** 预编译包）
-- 按当前壳写入 init（bash/zsh/fish/elvish/tcsh/nushell/xonsh/ion），并立即生效
+- 自动安装 Starship（优先包管理器；失败时根据 libc 自动选择 GNU/MUSL 预编译包）
+- 按当前壳写入 init（bash/zsh/fish/elvish/tcsh/nushell/xonsh/ion），并尽量立即生效
 - 生成 ~/.config/starship.toml（默认不覆盖，--force 才覆盖）
 - 幂等：先备份，避免重复
 
@@ -71,6 +71,44 @@ detect_current_shell() {
                *) printf "sh";; esac
 }
 
+# ===================== libc 检测 & 版本比较 =====================
+ver_ge(){  # ver_ge 2.18 2.17 -> true
+  # 纯 bash 版本比较：按点拆分逐段比较
+  local IFS=.; local -a A=(${1//[!0-9.]/}); local -a B=(${2//[!0-9.]/}); local i
+  for ((i=0; i<${#A[@]} || i<${#B[@]}; i++)); do
+    local a=${A[i]:-0}; local b=${B[i]:-0}
+    ((a>b)) && return 0
+    ((a<b)) && return 1
+  done
+  return 0
+}
+
+detect_libc() {
+  # 输出两行：第一行为 libc 名（glibc/musl/unknown），第二行是版本（可能为空）
+  local out ver
+  if command -v ldd >/dev/null 2>&1; then
+    out="$(ldd --version 2>&1 || true)"
+    if grep -qi 'musl' <<<"$out"; then
+      ver="$(grep -oE 'musl[^0-9]*([0-9]+(\.[0-9]+)*)' <<<"$out" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1 || true)"
+      printf "musl\n%s\n" "${ver:-}"
+      return
+    fi
+    if grep -qi 'glibc\|gnu libc\|gnu c library' <<<"$out"; then
+      ver="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | head -1 || true)"
+      printf "glibc\n%s\n" "${ver:-}"
+      return
+    fi
+    # 某些发行版 ldd 第一行：ldd (Debian GLIBC 2.36-xx) 2.36
+    if grep -qi 'glibc' <<<"$out"; then
+      ver="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | tail -1 || true)"
+      printf "glibc\n%s\n" "${ver:-}"
+      return
+    fi
+  fi
+  # Alpine 的 ldd 也会打印 musl；极少数系统没有 ldd
+  printf "unknown\n\n"
+}
+
 # ===================== 安装 Starship =====================
 install_starship_pkg() {
   command -v starship >/dev/null 2>&1 && return 0
@@ -94,26 +132,39 @@ install_starship_pkg() {
     $SUDO apt update -y || true
     $SUDO apt install -y starship && return 0 || true
   fi
-  if command -v dnf >/dev/null 2>&1; then log "Installing via dnf..."; $SUDO dnf install -y starship && return 0 || true; fi
-  if command -v yum >/dev/null 2>&1; then log "Installing via yum..."; $SUDO yum install -y starship && return 0 || true; fi
-  if command -v zypper >/dev/null 2>&1; then log "Installing via zypper..."; $SUDO zypper --non-interactive install starship && return 0 || true; fi
-  if command -v pacman >/dev/null 2>&1; then log "Installing via pacman..."; $SUDO pacman -Sy --noconfirm starship && return 0 || true; fi
-  if command -v apk >/dev/null 2>&1; then log "Installing via apk..."; $SUDO apk add --no-cache starship && return 0 || true; fi
-  if command -v brew >/dev/null 2>&1; then log "Installing via Homebrew..."; brew list starship >/dev/null 2>&1 || brew install starship; command -v starship >/dev/null 2>&1 && return 0 || true; fi
+  if command -v dnf  >/dev/null 2>&1; then log "Installing via dnf...";  $SUDO dnf  install -y starship && return 0 || true; fi
+  if command -v yum  >/dev/null 2>&1; then log "Installing via yum...";  $SUDO yum  install -y starship && return 0 || true; fi
+  if command -v zypper>/dev/null 2>&1; then log "Installing via zypper...";$SUDO zypper --non-interactive install starship && return 0 || true; fi
+  if command -v pacman>/dev/null 2>&1; then log "Installing via pacman...";$SUDO pacman -Sy --noconfirm starship && return 0 || true; fi
+  if command -v apk   >/dev/null 2>&1; then log "Installing via apk...";   $SUDO apk add --no-cache starship && return 0 || true; fi
+  if command -v brew  >/dev/null 2>&1; then log "Installing via Homebrew..."; brew list starship >/dev/null 2>&1 || brew install starship; command -v starship >/dev/null 2>&1 && return 0 || true; fi
   return 1
 }
 
-# ✅ 固定使用 musl 静态版作为回退
-install_starship_musl_fallback() {
+install_starship_auto_fallback() {
   command -v starship >/dev/null 2>&1 && return 0
-  log "Installing via MUSL prebuilt fallback..."
   local arch pkg url=/tmp/starship.tgz
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) pkg="starship-x86_64-unknown-linux-musl.tar.gz" ;;
-    aarch64|arm64) pkg="starship-aarch64-unknown-linux-musl.tar.gz" ;;
-    *) warn "Unsupported arch for MUSL fallback: $arch"; return 1 ;;
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *) warn "Unsupported arch: $(uname -m)"; return 1 ;;
   esac
+
+  # 选择 GNU 或 MUSL
+  read -r libc_name
+  read -r libc_ver < <(detect_libc | sed -n '2p') # 兼容老 bash 的 trick
+  libc_name="$(detect_libc | sed -n '1p')"
+  libc_ver="$(detect_libc | sed -n '2p')"
+
+  # 如果是 glibc 且版本 >= 2.18，用 gnu；否则一律 musl
+  if [[ "$libc_name" == "glibc" && -n "$libc_ver" ]] && ver_ge "$libc_ver" "2.18"; then
+    pkg="starship-${arch}-unknown-linux-gnu.tar.gz"
+  else
+    pkg="starship-${arch}-unknown-linux-musl.tar.gz"
+  fi
+
+  log "Installing via prebuilt fallback ($libc_name ${libc_ver:-?} -> $pkg)..."
   curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
     "https://github.com/starship/starship/releases/latest/download/$pkg"
   $SUDO tar -xzf "$url" -C /usr/local/bin starship
@@ -191,7 +242,7 @@ main() {
     if install_starship_pkg; then
       log "Starship installed via package manager."
     else
-      install_starship_musl_fallback || warn "Install fallback failed. Ensure network or install manually."
+      install_starship_auto_fallback || warn "Install fallback failed. Ensure network or install manually."
     fi
   else
     log "Skip install as requested."
