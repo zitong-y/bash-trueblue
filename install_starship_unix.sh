@@ -12,7 +12,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --enable-duration) ENABLE_DURATION=1; shift;;
     --force)           FORCE_TOML=1; shift;;
-    --shell)           FORCE_SHELL="$2"; shift 2;;
+    --shell)           FORCE_SHELL="${2:-}"; shift 2;;
     --no-install)      SKIP_INSTALL=1; shift;;
     -h|--help)
       cat <<'EOF'
@@ -27,7 +27,7 @@ Usage: bash ./install_starship_unix.sh [--enable-duration] [--force] [--shell <b
 默认只配置“当前壳”；可用 --shell 强制指定。
 EOF
       exit 0;;
-    *) echo "Unknown option: $1"; exit 2;;
+    *) echo "Unknown option: $1" ; exit 2;;
   esac
 done
 
@@ -39,9 +39,8 @@ ensure_line(){ local f="$1"; shift; local line="$*"; mkdir -p "$(dirname "$f")";
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
 
-# ===================== 当前壳检测（父进程壳 > 登录壳 > 运行时壳 > $SHELL） =====================
+# ===================== 壳检测（父进程壳 > 登录壳 > 运行时壳 > $SHELL） =====================
 detect_current_shell() {
-  # 登录壳
   local login_shell=""
   if command -v getent >/dev/null 2>&1; then
     login_shell="$(getent passwd "$(id -un)" | awk -F: '{print $NF}' | xargs basename)"
@@ -49,14 +48,11 @@ detect_current_shell() {
     login_shell="$(awk -F: -v u="$(id -un)" '$1==u{print $NF}' /etc/passwd | xargs basename)"
   fi
 
-  # 父进程链交互壳（避免 curl ... | bash 误判）
   local ppid name parent_shell=""
   ppid="$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')"
   while [[ -n "${ppid:-}" && "$ppid" != "1" ]]; do
     name="$(ps -p "$ppid" -o comm= 2>/dev/null | xargs basename | tr '[:upper:]' '[:lower:]' || true)"
-    case "$name" in
-      bash|zsh|fish|elvish|tcsh|csh|nu|nushell|xonsh|ion) parent_shell="$name"; break;;
-    esac
+    case "$name" in bash|zsh|fish|elvish|tcsh|csh|nu|nushell|xonsh|ion) parent_shell="$name"; break;; esac
     ppid="$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ' || true)"
   done
 
@@ -72,47 +68,28 @@ detect_current_shell() {
 }
 
 # ===================== 版本比较 / libc 检测 =====================
-ver_ge(){  # ver_ge <v1> <v2> : v1 >= v2 ?
-  local IFS=.; local -a A=(${1//[!0-9.]/}); local -a B=(${2//[!0-9.]/}); local i
-  for ((i=0; i<${#A[@]} || i<${#B[@]}; i++)); do
-    local a=${A[i]:-0}; local b=${B[i]:-0}
-    ((a>b)) && return 0
-    ((a<b)) && return 1
-  done
-  return 0
-}
-
+ver_ge(){ local IFS=.; local -a A=(${1//[!0-9.]/}); local -a B=(${2//[!0-9.]/}); local i; for ((i=0;i<${#A[@]}||i<${#B[@]};i++)); do local a=${A[i]:-0}; local b=${B[i]:-0}; ((a>b))&&return 0; ((a<b))&&return 1; done; return 0; }
 detect_libc() {
-  # 回传两变量：LIBC_NAME, LIBC_VER
   LIBC_NAME="unknown"; LIBC_VER=""
   if command -v ldd >/dev/null 2>&1; then
     local out; out="$(ldd --version 2>&1 || true)"
     if grep -qi 'musl' <<<"$out"; then
       LIBC_NAME="musl"
-      LIBC_VER="$(grep -oE 'musl[^0-9]*([0-9]+(\.[0-9]+)*)' <<<"$out" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1 || true)"
-      return 0
+      LIBC_VER="$(grep -oE 'musl[^0-9]*([0-9]+(\.[0-9]+)*)' <<<"$out" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1 || true)"; return 0
     fi
     if grep -qi 'glibc\|gnu libc\|gnu c library' <<<"$out"; then
       LIBC_NAME="glibc"
-      # Debian 风格可能有两处数字，取最后一个
-      LIBC_VER="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | tail -1 || true)"
-      return 0
+      LIBC_VER="$(grep -oE '([0-9]+(\.[0-9]+)+)' <<<"$out" | tail -1 || true)"; return 0
     fi
   fi
   return 0
 }
-
 need_musl_due_to_glibc() {
-  # 条件1：glibc 且版本 < 2.18
   detect_libc
   if [[ "$LIBC_NAME" == "glibc" ]]; then
     [[ -n "$LIBC_VER" ]] && ! ver_ge "$LIBC_VER" "2.18" && return 0
   fi
-  # 条件2：系统不是 glibc（musl/unknown），直接用 musl 更稳
-  if [[ "$LIBC_NAME" != "glibc" ]]; then
-    return 0
-  fi
-  # 条件3：已有 starship 但运行时报 glibc 符号错误
+  if [[ "$LIBC_NAME" != "glibc" ]]; then return 0; fi
   if command -v starship >/dev/null 2>&1; then
     if ! starship --version >/dev/null 2>&1; then
       starship --version 2>&1 | grep -q 'GLIBC_2\.18' && return 0
@@ -120,33 +97,46 @@ need_musl_due_to_glibc() {
   fi
   return 1
 }
-
 choose_prebuilt_pkg() {
-  # 根据架构 + libc 决定下载的包名，echo 返回
-  local arch uname_m pkg
-  uname_m="$(uname -m)"
-  case "$uname_m" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) warn "Unsupported arch: $uname_m"; return 1 ;;
-  esac
-
-  if need_musl_due_to_glibc; then
-    pkg="starship-${arch}-unknown-linux-musl.tar.gz"
-  else
-    pkg="starship-${arch}-unknown-linux-gnu.tar.gz"
-  fi
+  local arch uname_m pkg; uname_m="$(uname -m)"
+  case "$uname_m" in x86_64|amd64) arch="x86_64";; aarch64|arm64) arch="aarch64";; *) warn "Unsupported arch: $uname_m"; return 1;; esac
+  if need_musl_due_to_glibc; then pkg="starship-${arch}-unknown-linux-musl.tar.gz"; else pkg="starship-${arch}-unknown-linux-gnu.tar.gz"; fi
   echo "$pkg"
+}
+
+# ===================== 依赖补齐 & 仓库开关 =====================
+ensure_cmd() {
+  local c="$1"
+  command -v "$c" >/dev/null 2>&1 && return 0
+  if   command -v dnf >/dev/null 2>&1;  then $SUDO dnf install -y "$c" || true
+  elif command -v yum >/dev/null 2>&1;  then $SUDO yum install -y "$c" || true
+  elif command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -y || true; $SUDO apt-get install -y "$c" || true
+  elif command -v apk >/dev/null 2>&1;  then $SUDO apk add --no-cache "$c" || true
+  elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install "$c" || true
+  elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm "$c" || true
+  fi
+}
+enable_epel_if_rhel_family() {
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    if [[ "${ID_LIKE:-}" =~ rhel|centos|fedora || "${ID:-}" =~ rhel|centos|rocky|almalinux || "${ID:-}" == "tencentos" || "${ID:-}" == "openEuler" ]]; then
+      if command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y epel-release || true
+      elif command -v yum >/dev/null 2>&1; then
+        $SUDO yum install -y epel-release || true
+      fi
+    fi
+  fi
 }
 
 # ===================== 安装 Starship =====================
 install_starship_pkg() {
   command -v starship >/dev/null 2>&1 && return 0
+  enable_epel_if_rhel_family
   if command -v apt-get >/dev/null 2>&1; then
     log "Installing via apt-get..."
     $SUDO apt-get update -y || true
     $SUDO apt-get install -y starship && return 0 || true
-    # Debian backports（有些版本仓库没打包）
     if [[ -r /etc/os-release ]]; then
       . /etc/os-release
       if [[ "${ID:-}" = "debian" || "${ID_LIKE:-}" =~ debian ]]; then
@@ -157,22 +147,19 @@ install_starship_pkg() {
       fi
     fi
   fi
-  if command -v apt >/dev/null 2>&1; then
-    log "Installing via apt..."
-    $SUDO apt update -y || true
-    $SUDO apt install -y starship && return 0 || true
-  fi
-  if command -v dnf  >/dev/null 2>&1; then log "Installing via dnf...";  $SUDO dnf  install -y starship && return 0 || true; fi
-  if command -v yum  >/dev/null 2>&1; then log "Installing via yum...";  $SUDO yum  install -y starship && return 0 || true; fi
-  if command -v zypper>/dev/null 2>&1; then log "Installing via zypper...";$SUDO zypper --non-interactive install starship && return 0 || true; fi
-  if command -v pacman>/dev/null 2>&1; then log "Installing via pacman...";$SUDO pacman -Sy --noconfirm starship && return 0 || true; fi
-  if command -v apk   >/dev/null 2>&1; then log "Installing via apk...";   $SUDO apk add --no-cache starship && return 0 || true; fi
-  if command -v brew  >/dev/null 2>&1; then log "Installing via Homebrew..."; brew list starship >/dev/null 2>&1 || brew install starship; command -v starship >/dev/null 2>&1 && return 0 || true; fi
+  if command -v apt >/dev/null 2>&1; then log "Installing via apt..."; $SUDO apt update -y || true; $SUDO apt install -y starship && return 0 || true; fi
+  if command -v dnf >/dev/null 2>&1;  then log "Installing via dnf...";  $SUDO dnf  install -y starship && return 0 || true; fi
+  if command -v yum >/dev/null 2>&1;  then log "Installing via yum...";  $SUDO yum  install -y starship && return 0 || true; fi
+  if command -v zypper >/dev/null 2>&1; then log "Installing via zypper..."; $SUDO zypper --non-interactive install starship && return 0 || true; fi
+  if command -v pacman >/dev/null 2>&1; then log "Installing via pacman..."; $SUDO pacman -Sy --noconfirm starship && return 0 || true; fi
+  if command -v apk >/dev/null 2>&1;   then log "Installing via apk...";   $SUDO apk add --no-cache starship && return 0 || true; fi
+  if command -v brew >/dev/null 2>&1;  then log "Installing via Homebrew..."; brew list starship >/dev/null 2>&1 || brew install starship; command -v starship >/dev/null 2>&1 && return 0 || true; fi
   return 1
 }
-
 install_starship_auto_fallback() {
   command -v starship >/dev/null 2>&1 && return 0
+  ensure_cmd tar
+  ensure_cmd curl || ensure_cmd wget
   local pkg url=/tmp/starship.tgz
   pkg="$(choose_prebuilt_pkg)" || { warn "failed to choose prebuilt pkg"; return 1; }
   log "Installing via prebuilt fallback (pkg: $pkg)..."
@@ -182,11 +169,12 @@ install_starship_auto_fallback() {
   else
     wget -O "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"
   fi
+  $SUDO mkdir -p /usr/local/bin
   $SUDO tar -xzf "$url" -C /usr/local/bin starship
   $SUDO chmod +x /usr/local/bin/starship
 }
 
-# ===================== 写 starship.toml（不覆盖） =====================
+# ===================== 写 starship.toml（目录用“真蓝” #1E90FF） =====================
 write_starship_toml() {
   local dir="${XDG_CONFIG_HOME:-$HOME/.config}"; local file="$dir/starship.toml"
   mkdir -p "$dir"
@@ -210,16 +198,13 @@ style = "bold green"
 
 [directory]
 format = " [$path]($style)"
-style = "bold blue"
+style = "bold #1E90FF"   # 真蓝（DodgerBlue），避免主题把 blue 显成偏紫
 truncation_length = 3
 truncate_to_repo = false
 
 [character]
 success_symbol = "[›](bold green) "
 error_symbol   = "[›](bold red) "
-
-[cmd_duration]
-disabled = true
 TOML
   if [[ "$ENABLE_DURATION" -eq 1 ]]; then
     cat >>"$file" <<'TOML'
@@ -228,6 +213,11 @@ min_time = 2000
 format = " took [$duration]($style)"
 style = "bold yellow"
 disabled = false
+TOML
+  else
+    cat >>"$file" <<'TOML'
+[cmd_duration]
+disabled = true
 TOML
   fi
   log "Wrote $file"
@@ -261,24 +251,15 @@ main() {
     log "Skip install as requested."
   fi
 
-  # 若已有 starship 但是 glibc 错误，自动换 MUSL（保险起见）
+  # 若已有 starship 但因 GLIBC_2.18 报错，则强制 MUSL 覆盖安装
   if command -v starship >/dev/null 2>&1; then
     if ! starship --version >/dev/null 2>&1; then
       if starship --version 2>&1 | grep -q 'GLIBC_2\.18'; then
         warn "Detected GLIBC_2.18 error; switching to MUSL build..."
-        # 覆盖安装 MUSL 版本
-        choose_prebuilt_pkg >/dev/null
-        # 强制 MUSL
-        local arch uname_m url=/tmp/starship.tgz
-        uname_m="$(uname -m)"
-        case "$uname_m" in x86_64|amd64) arch="x86_64";; aarch64|arm64) arch="aarch64";; *) arch="x86_64";; esac
-        local pkg="starship-${arch}-unknown-linux-musl.tar.gz"
-        if command -v curl >/dev/null 2>&1; then
-          curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
-            "https://github.com/starship/starship/releases/latest/download/$pkg"
-        else
-          wget -O "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"
-        fi
+        ensure_cmd tar; ensure_cmd curl || ensure_cmd wget
+        local arch="x86_64"; case "$(uname -m)" in aarch64|arm64) arch="aarch64";; esac
+        local url="/tmp/starship_musl.tgz" pkg="starship-${arch}-unknown-linux-musl.tar.gz"
+        if command -v curl >/dev/null 2>&1; then curl -fL -o "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"; else wget -O "$url" "https://github.com/starship/starship/releases/latest/download/$pkg"; fi
         $SUDO tar -xzf "$url" -C /usr/local/bin starship
         $SUDO chmod +x /usr/local/bin/starship
       fi
