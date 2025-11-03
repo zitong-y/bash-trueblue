@@ -1,93 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========== 配置区（可按需替换每个分支里的命令） ==========
-# 下面以“给不同壳追加 Starship 初始化语句”为例做 payload。
-# 你可以把每个 run_for_* 函数里的命令换成你自己的动作。
+# ===================== 用户选项 =====================
+ENABLE_DURATION=0     # 启用 cmd_duration：--enable-duration
+FORCE_TOML=0          # 覆盖 ~/.config/starship.toml：--force
+FORCE_SHELL=""        # 强制目标壳：--shell zsh|bash|fish|...
+SKIP_INSTALL=0        # 跳过安装：--no-install
 
-log()  { printf "[*] %s\n" "$*"; }
-warn() { printf "[!] %s\n" "$*" >&2; }
-
-backup_once(){ [[ -f "$1" ]] && cp -p "$1" "$1.bak-$(date +%Y%m%d-%H%M%S)" || true; }
-ensure_line(){  # ensure_line <file> <exact line>
-  local f="$1"; shift; local line="$*"
-  mkdir -p "$(dirname "$f")"; [[ -f "$f" ]] || touch "$f"
-  if ! grep -Fqx "$line" "$f" 2>/dev/null; then
-    backup_once "$f"
-    printf "%s\n" "$line" >> "$f"
-    log "Appended to $f"
-  else
-    log "Already present: $f"
-  fi
-}
-
-# 让登录 shell 同样读取 rc（避免 login shell 不读 .bashrc/.zshrc）
-ensure_login_reads_rc_bash(){
-  local t="$HOME/.bash_profile"; [[ -f "$HOME/.profile" ]] && t="$HOME/.profile"
-  ensure_line "$t" '[ -n "$BASH_VERSION" ] && [ -f ~/.bashrc ] && . ~/.bashrc'
-}
-ensure_login_reads_rc_zsh(){
-  # 大多默认会读 ~/.zshrc，这里兜底让 ~/.zprofile source 一下
-  ensure_line "$HOME/.zprofile" '[ -f ~/.zshrc ] && . ~/.zshrc'
-}
-
-# ---- 每种壳要做的事（示例：写入 starship init） ----
-run_for_bash(){
-  ensure_line "$HOME/.bashrc" 'eval "$(starship init bash)"'
-  ensure_login_reads_rc_bash
-  # 你也可以在这加别的命令，比如导出环境变量、alias 等
-  log "Reloading bash: source ~/.bashrc"
-  . "$HOME/.bashrc" 2>/dev/null || true
-}
-
-run_for_zsh(){
-  ensure_line "$HOME/.zshrc" 'eval "$(starship init zsh)"'
-  ensure_login_reads_rc_zsh
-  log "Reloading zsh : source ~/.zshrc"
-  . "$HOME/.zshrc" 2>/dev/null || true
-}
-
-run_for_fish(){
-  ensure_line "$HOME/.config/fish/config.fish" 'starship init fish | source'
-  log "Reloading fish: exec fish -l"
-  exec fish -l
-}
-
-run_for_elvish(){ ensure_line "$HOME/.elvish/rc.elv" 'eval (starship init elvish)' ; }
-run_for_tcsh(){   ensure_line "$HOME/.tcshrc"        'eval `starship init tcsh`' ; }
-run_for_nu(){     # Nushell：先生成 init 脚本再在 config.nu 里 source
-  mkdir -p "$HOME/.cache/starship"
-  starship init nu > "$HOME/.cache/starship/init.nu"
-  ensure_line "$HOME/.config/nushell/config.nu" 'source ~/.cache/starship/init.nu'
-}
-run_for_xonsh(){
-  ensure_line "$HOME/.xonshrc" '$STARSHIP_INIT = !("starship init xonsh")'
-  ensure_line "$HOME/.xonshrc" 'execx($STARSHIP_INIT)'
-  ensure_line "$HOME/.xonshrc" 'del $STARSHIP_INIT'
-}
-run_for_ion(){    ensure_line "$HOME/.config/ion/initrc" 'eval $(starship init ion)' ; }
-
-# ========== 壳检测：父进程交互壳 > 登录壳 > 运行时壳 > $SHELL ==========
-FORCE_SHELL="${FORCE_SHELL:-${STARSHIP_FORCE_SHELL:-}}"
-
+# 解析参数
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --shell) FORCE_SHELL="$2"; shift 2;;
+    --enable-duration) ENABLE_DURATION=1; shift;;
+    --force)           FORCE_TOML=1; shift;;
+    --shell)           FORCE_SHELL="$2"; shift 2;;
+    --no-install)      SKIP_INSTALL=1; shift;;
     -h|--help)
       cat <<'EOF'
-Usage: bash ./shell_router.sh [--shell bash|zsh|fish|elvish|tcsh|nu|xonsh|ion]
+Usage: bash ./install_starship_unix.sh [--enable-duration] [--force] [--shell <bash|zsh|fish|...>] [--no-install]
 
-作用：这个脚本总是用 bash 执行，但会自动检测你本来在用的交互壳，
-然后调用相应分支（示例是为不同壳写入 starship init）。
-可用 --shell 或环境变量 FORCE_SHELL 覆盖自动检测。
+功能：
+- 自动安装 Starship（优先包管理器，Debian 自动启用 backports；失败回退 GNU 预编译包）
+- 按当前壳写入 init（bash/zsh/fish/elvish/tcsh/nushell/xonsh/ion），并立即生效
+- 生成 ~/.config/starship.toml（默认不覆盖，--force 才覆盖）
+- 幂等：先备份，避免重复
+
+默认只配置“当前壳”；可用 --shell 强制指定。
 EOF
       exit 0;;
     *) echo "Unknown option: $1"; exit 2;;
   esac
 done
 
+log()  { printf "[*] %s\n" "$*"; }
+warn() { printf "[!] %s\n" "$*" >&2; }
+bk()   { [[ -f "$1" ]] && cp -p "$1" "$1.bak-$(date +%Y%m%d-%H%M%S)" || true; }
+ensure_line(){ local f="$1"; shift; local line="$*"; mkdir -p "$(dirname "$f")"; [[ -f "$f" ]]||:> "$f"; grep -Fqx "$line" "$f" 2>/dev/null || { bk "$f"; printf "%s\n" "$line" >>"$f"; log "Appended to $f"; }; }
+
+SUDO=""
+if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+
+# ===================== 当前壳检测（父进程壳 > 登录壳 > 运行时壳 > $SHELL） =====================
 detect_current_shell() {
-  # ① 登录壳（/etc/passwd）
+  # 登录壳
   local login_shell=""
   if command -v getent >/dev/null 2>&1; then
     login_shell="$(getent passwd "$(id -un)" | awk -F: '{print $NF}' | xargs basename)"
@@ -95,38 +49,154 @@ detect_current_shell() {
     login_shell="$(awk -F: -v u="$(id -un)" '$1==u{print $NF}' /etc/passwd | xargs basename)"
   fi
 
-  # ② 父进程链上的交互壳（避免 curl … | bash 误判）
-  local ppid name shell_in_ppid=""
+  # 父进程链交互壳（避免 curl ... | bash 误判）
+  local ppid name parent_shell=""
   ppid="$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')"
-  while [[ -n "$ppid" && "$ppid" != "1" ]]; do
-    name="$(ps -p "$ppid" -o comm= 2>/dev/null | xargs basename | tr '[:upper:]' '[:lower:]')"
+  while [[ -n "${ppid:-}" && "$ppid" != "1" ]]; do
+    name="$(ps -p "$ppid" -o comm= 2>/dev/null | xargs basename | tr '[:upper:]' '[:lower:]' || true)"
     case "$name" in
-      bash|zsh|fish|elvish|tcsh|csh|nu|nushell|xonsh|ion)
-        shell_in_ppid="$name"; break;;
+      bash|zsh|fish|elvish|tcsh|csh|nu|nushell|xonsh|ion) parent_shell="$name"; break;;
     esac
-    ppid="$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ')"
+    ppid="$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ' || true)"
   done
 
-  # ③ 运行时壳 & 环境
   local run_shell env_shell
-  run_shell="$(ps -p $$ -o comm= 2>/dev/null | xargs basename | tr '[:upper:]' '[:lower:]')"
-  env_shell="$(basename "${SHELL:-}" 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  run_shell="$(ps -p $$ -o comm= 2>/dev/null | xargs basename | tr '[:upper:]' '[:lower:]' || true)"
+  env_shell="$(basename "${SHELL:-}" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
 
-  local s="${shell_in_ppid:-${login_shell:-${run_shell:-$env_shell}}}"
+  local s="${parent_shell:-${login_shell:-${run_shell:-$env_shell}}}"
   s="${s#-}"; s="${s,,}"
-  case "$s" in
-    csh)  s="tcsh" ;;
-    nushell) s="nu" ;;
-  esac
-  case "$s" in
-    bash|zsh|fish|elvish|tcsh|nu|xonsh|ion) printf "%s" "$s" ;;
-    *) printf "sh" ;;  # 不支持的壳
-  esac
+  case "$s" in csh) s="tcsh";; nushell) s="nu";; esac
+  case "$s" in bash|zsh|fish|elvish|tcsh|nu|xonsh|ion) printf "%s" "$s";;
+               *) printf "sh";; esac
 }
 
+# ===================== 安装 Starship =====================
+install_starship_pkg() {
+  command -v starship >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    log "Installing via apt-get..."
+    $SUDO apt-get update -y || true
+    $SUDO apt-get install -y starship && return 0 || true
+    # Debian/Ubuntu 回退：启用 backports（Debian）
+    if [[ -r /etc/os-release ]]; then
+      . /etc/os-release
+      if [[ "${ID:-}" = "debian" || "${ID_LIKE:-}" =~ debian ]]; then
+        local codename="${VERSION_CODENAME:-bookworm}"
+        echo "deb http://deb.debian.org/debian ${codename}-backports main" | $SUDO tee /etc/apt/sources.list.d/backports.list >/dev/null
+        $SUDO apt-get update -y
+        $SUDO apt-get -t "${codename}-backports" install -y starship && return 0 || true
+      fi
+    fi
+  fi
+  if command -v apt >/dev/null 2>&1; then
+    log "Installing via apt..."
+    $SUDO apt update -y || true
+    $SUDO apt install -y starship && return 0 || true
+  fi
+  if command -v dnf >/dev/null 2>&1; then log "Installing via dnf..."; $SUDO dnf install -y starship && return 0 || true; fi
+  if command -v yum >/dev/null 2>&1; then log "Installing via yum..."; $SUDO yum install -y starship && return 0 || true; fi
+  if command -v zypper >/dev/null 2>&1; then log "Installing via zypper..."; $SUDO zypper --non-interactive install starship && return 0 || true; fi
+  if command -v pacman >/dev/null 2>&1; then log "Installing via pacman..."; $SUDO pacman -Sy --noconfirm starship && return 0 || true; fi
+  if command -v apk >/dev/null 2>&1; then log "Installing via apk..."; $SUDO apk add --no-cache starship && return 0 || true; fi
+  if command -v brew >/dev/null 2>&1; then log "Installing via Homebrew..."; brew list starship >/dev/null 2>&1 || brew install starship; command -v starship >/dev/null 2>&1 && return 0 || true; fi
+  return 1
+}
+
+install_starship_gnu_fallback() {
+  command -v starship >/dev/null 2>&1 && return 0
+  log "Installing via GNU prebuilt fallback..."
+  local arch pkg url=/tmp/starship.tgz
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) pkg="starship-x86_64-unknown-linux-gnu.tar.gz" ;;
+    aarch64|arm64) pkg="starship-aarch64-unknown-linux-gnu.tar.gz" ;;
+    *) warn "Unsupported arch for GNU fallback: $arch"; return 1 ;;
+  esac
+  curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
+    "https://github.com/starship/starship/releases/latest/download/$pkg"
+  $SUDO tar -xzf "$url" -C /usr/local/bin starship
+  $SUDO chmod +x /usr/local/bin/starship
+}
+
+# ===================== 写 starship.toml（不覆盖） =====================
+write_starship_toml() {
+  local dir="${XDG_CONFIG_HOME:-$HOME/.config}"; local file="$dir/starship.toml"
+  mkdir -p "$dir"
+  if [[ -f "$file" && "$FORCE_TOML" -eq 0 ]]; then
+    bk "$file"; log "Config exists ($file). Backup created. Keep your existing config (no overwrite)."; return 0
+  fi
+  [[ -f "$file" ]] && bk "$file"
+  cat >"$file" <<'TOML'
+format = "$username in$hostname in $directory\n$character"
+
+[username]
+show_always = true
+format = " [$user]($style)"
+style_root = "bold red"
+style_user = "bold red"
+
+[hostname]
+ssh_only = false
+format = " 🌐 [$hostname]($style)"
+style = "bold green"
+
+[directory]
+format = " [$path]($style)"
+style = "bold blue"
+truncation_length = 3
+truncate_to_repo = false
+
+[character]
+success_symbol = "[›](bold green) "
+error_symbol   = "[›](bold red) "
+TOML
+  if [[ "$ENABLE_DURATION" -eq 1 ]]; then
+    cat >>"$file" <<'TOML'
+[cmd_duration]
+min_time = 2000
+format = " took [$duration]($style)"
+style = "bold yellow"
+disabled = false
+TOML
+  else
+    cat >>"$file" <<'TOML'
+[cmd_duration]
+disabled = true
+TOML
+  fi
+  log "Wrote $file"
+}
+
+# ===================== 针对每种壳写入 rc + 立即生效 =====================
+ensure_login_reads_rc_bash(){ local t="$HOME/.bash_profile"; [[ -f "$HOME/.profile" ]] && t="$HOME/.profile"; ensure_line "$t" '[ -n "$BASH_VERSION" ] && [ -f ~/.bashrc ] && . ~/.bashrc'; }
+ensure_login_reads_rc_zsh(){ ensure_line "$HOME/.zprofile" '[ -f ~/.zshrc ] && . ~/.zshrc'; }
+
+run_for_bash(){ ensure_line "$HOME/.bashrc" 'eval "$(starship init bash)"'; ensure_login_reads_rc_bash; log "Reloading bash: source ~/.bashrc"; . "$HOME/.bashrc" 2>/dev/null || true; }
+run_for_zsh(){  ensure_line "$HOME/.zshrc"  'eval "$(starship init zsh)"' ; ensure_login_reads_rc_zsh ; log "Reloading zsh : source ~/.zshrc" ; . "$HOME/.zshrc"  2>/dev/null || true; }
+run_for_fish(){ ensure_line "$HOME/.config/fish/config.fish" 'starship init fish | source'; log "Reloading fish: exec fish -l"; exec fish -l; }
+run_for_elvish(){ ensure_line "$HOME/.elvish/rc.elv" 'eval (starship init elvish)'; }
+run_for_tcsh(){   ensure_line "$HOME/.tcshrc"        'eval `starship init tcsh`'; }
+run_for_nu(){     mkdir -p "$HOME/.cache/starship"; starship init nu > "$HOME/.cache/starship/init.nu"; ensure_line "$HOME/.config/nushell/config.nu" 'source ~/.cache/starship/init.nu'; }
+run_for_xonsh(){  ensure_line "$HOME/.xonshrc" '$STARSHIP_INIT = !("starship init xonsh")'; ensure_line "$HOME/.xonshrc" 'execx($STARSHIP_INIT)'; ensure_line "$HOME/.xonshrc" 'del $STARSHIP_INIT'; }
+run_for_ion(){    ensure_line "$HOME/.config/ion/initrc" 'eval $(starship init ion)'; }
+
+# ===================== 主流程 =====================
 main() {
   local cur="${FORCE_SHELL:-$(detect_current_shell)}"
   log "Detected current shell: ${cur}${FORCE_SHELL:+ (forced)}"
+
+  if [[ "$SKIP_INSTALL" -eq 0 ]]; then
+    if install_starship_pkg; then
+      log "Starship installed via package manager."
+    else
+      install_starship_gnu_fallback || warn "Install fallback failed. Ensure network or install manually."
+    fi
+  else
+    log "Skip install as requested."
+  fi
+
+  write_starship_toml
 
   case "$cur" in
     bash)  run_for_bash  ;;
@@ -137,8 +207,8 @@ main() {
     nu)    run_for_nu    ;;
     xonsh) run_for_xonsh ;;
     ion)   run_for_ion   ;;
-    sh)    warn "This shell (sh/dash) is not supported by Starship. Skipped." ;;
-    *)     warn "Unknown shell: $cur" ;;
+    sh)    warn "This shell (sh/dash) is not supported by Starship. Skipped."; exit 1;;
+    *)     warn "Unknown shell: $cur"; exit 1;;
   esac
 
   echo "✅ Done (shell: $cur)"
