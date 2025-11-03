@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do
 Usage: bash ./install_starship_unix.sh [--enable-duration] [--force] [--shell <bash|zsh|fish|...>] [--no-install]
 
 功能：
-- 自动安装 Starship（优先包管理器，Debian 自动启用 backports；失败回退 GNU 预编译包）
+- 自动安装 Starship（优先包管理器；失败回退为 **musl 静态版** 预编译包）
 - 按当前壳写入 init（bash/zsh/fish/elvish/tcsh/nushell/xonsh/ion），并立即生效
 - 生成 ~/.config/starship.toml（默认不覆盖，--force 才覆盖）
 - 幂等：先备份，避免重复
@@ -78,7 +78,7 @@ install_starship_pkg() {
     log "Installing via apt-get..."
     $SUDO apt-get update -y || true
     $SUDO apt-get install -y starship && return 0 || true
-    # Debian/Ubuntu 回退：启用 backports（Debian）
+    # Debian backports（有些版本仓库没打包）
     if [[ -r /etc/os-release ]]; then
       . /etc/os-release
       if [[ "${ID:-}" = "debian" || "${ID_LIKE:-}" =~ debian ]]; then
@@ -103,15 +103,16 @@ install_starship_pkg() {
   return 1
 }
 
-install_starship_gnu_fallback() {
+# ✅ 固定使用 musl 静态版作为回退
+install_starship_musl_fallback() {
   command -v starship >/dev/null 2>&1 && return 0
-  log "Installing via GNU prebuilt fallback..."
+  log "Installing via MUSL prebuilt fallback..."
   local arch pkg url=/tmp/starship.tgz
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) pkg="starship-x86_64-unknown-linux-gnu.tar.gz" ;;
-    aarch64|arm64) pkg="starship-aarch64-unknown-linux-gnu.tar.gz" ;;
-    *) warn "Unsupported arch for GNU fallback: $arch"; return 1 ;;
+    x86_64|amd64) pkg="starship-x86_64-unknown-linux-musl.tar.gz" ;;
+    aarch64|arm64) pkg="starship-aarch64-unknown-linux-musl.tar.gz" ;;
+    *) warn "Unsupported arch for MUSL fallback: $arch"; return 1 ;;
   esac
   curl -fL --retry 5 --connect-timeout 10 --max-time 300 -o "$url" \
     "https://github.com/starship/starship/releases/latest/download/$pkg"
@@ -190,7 +191,7 @@ main() {
     if install_starship_pkg; then
       log "Starship installed via package manager."
     else
-      install_starship_gnu_fallback || warn "Install fallback failed. Ensure network or install manually."
+      install_starship_musl_fallback || warn "Install fallback failed. Ensure network or install manually."
     fi
   else
     log "Skip install as requested."
